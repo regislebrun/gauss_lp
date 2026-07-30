@@ -38,6 +38,7 @@ ot.ResourceMap.SetAsString("Distribution-SupportPointStyleDiscretePDF", "bullet"
 ot.ResourceMap.SetAsBool("Distribution-ScaleColorsDiscretePDF", True)
 
 
+
 def gauss_lp_quadrature(measure, polynoms, sensitivity=None, domain=None,
                         alphaS=100, Ngauss=100, epsilon=5e-5, with_mean=True,
                         verbose=False, show_pdf=False):
@@ -121,11 +122,17 @@ def gauss_lp_quadrature(measure, polynoms, sensitivity=None, domain=None,
     # ---- Step 4+5: cluster and refine ----
     path = build_cluster_path(XS_support, w)
 
-    n_min = 1
+    # Try from N/(d+1) clusters up to n_support
+    # Try from 1 cluster up to n_support
+    n_min = 1#max(N // (dimension + 1), 1)
     best_residual = ot.SpecFunc.MaxScalar
     best_nodes = None
     best_weights = None
     converged = False
+
+    # We save the successive quadrature until the optimal one
+    quad_nodes_coll = list()
+    quad_weights_coll = list()
 
     for n_clusters in range(n_min, n_support + 1):
         if verbose:
@@ -139,9 +146,13 @@ def gauss_lp_quadrature(measure, polynoms, sensitivity=None, domain=None,
         size = len(XSi)
         flat_size = size * dimension
 
+        # Build objective: sum of squared moment residuals
+        # Variables: [w_0..w_{size-1}, x_0..x_{size*dimension-1}]
+        # For non-box domains, penalize points outside the domain
         need_domain_check = (domain is not None)
 
         if with_mean:
+            # Find which of the starting points (points of the measure based on the cluster points) is the closest to the mean
             iMean = 0
             dMean = (meanMeasure - XSi[0]).normSquare()
             for ic in range(1, len(XSi)):
@@ -167,12 +178,14 @@ def gauss_lp_quadrature(measure, polynoms, sensitivity=None, domain=None,
             residual = phi * w_part - moments
             value = residual.normSquare()
             if with_mean:
+                # Penalize the distance of the nearest node to the mean of the measure
                 value += (meanMeasure - XS_eval[iMean]).normSquare()
             return [value]
 
         objective = ot.PythonFunction(size + flat_size, 1, objective_py)
 
         problem = ot.OptimizationProblem(objective)
+        # Bounds: weights in [0, 1], nodes in domain box
         lb_weights = [0.0] * size
         ub_weights = [1.0] * size
         lb_nodes = list(a_lower) * size
@@ -181,6 +194,7 @@ def gauss_lp_quadrature(measure, polynoms, sensitivity=None, domain=None,
         problem.setBounds(bounds)
 
         algo = ot.TNC(problem)
+        # TNC needs enough evaluations: ~1000 per variable for convergence
         max_calls = max(10000, 1000 * (size + flat_size))
         algo.setMaximumCallsNumber(max_calls)
         algo.setMaximumIterationNumber(int(0.5 * max_calls))
@@ -194,6 +208,16 @@ def gauss_lp_quadrature(measure, polynoms, sensitivity=None, domain=None,
             result = algo.getResult()
             x_final = result.getOptimalPoint()
             residual_sq = objective(x_final)[0]
+
+            # We save the actual quadrature
+            # even if it is not better thant the previous one
+            temp_best_nodes =  ot.Sample(
+                np.array(x_final[size:]).reshape((size, dimension))
+            )
+            temp_best_weights = ot.Point(x_final[:size])
+            quad_nodes_coll.append(temp_best_nodes)
+            quad_weights_coll.append(temp_best_weights)
+            
         except Exception as e:
             if verbose:
                 print(f"  {algo.getClassName()} failed: {e}")
@@ -223,10 +247,12 @@ def gauss_lp_quadrature(measure, polynoms, sensitivity=None, domain=None,
                   f"with {len(best_weights)} nodes")
 
     if show_pdf:
+        # pas besoin de normaliser!
         total_w = sum(best_weights)
         probabilities = [w / total_w for w in best_weights]
         disc_dist = ot.FiniteDiscreteDistribution(best_nodes, probabilities)
-        graph = disc_dist.drawPDF(measure.getRange().getLowerBound(), measure.getRange().getUpperBound())
+        graph = disc_dist.drawPDF(best_nodes.getMin(),best_nodes.getMax(),[101]*2)
+        #graph = disc_dist.drawPDF(measure.getRange().getLowerBound(), measure.getRange().getUpperBound())
         if with_mean:
             pt = ot.Cloud([meanMeasure])
             pt.setColor("white")
@@ -242,7 +268,5 @@ def gauss_lp_quadrature(measure, polynoms, sensitivity=None, domain=None,
             f"{dimension}D)"
         )
         ot.Show(graph)
-
-    return best_nodes, best_weights, moments
-
-
+    
+    return best_nodes, best_weights, best_residual, moments, quad_nodes_coll, quad_weights_coll
