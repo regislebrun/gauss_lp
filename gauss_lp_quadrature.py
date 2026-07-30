@@ -12,9 +12,16 @@ References:
   Programming", Found Comput Math (2015) 15: 953-971.
 """
 
+import numpy as np
+
 import openturns as ot
 import openturns.experimental as otexp
-import numpy as np
+
+from compute_moments import compute_moments
+from generate_sample_points import generate_sample_points
+from solve_lp import solve_lp
+from cluster_rule import cluster_rule
+from build_cluster_path import build_cluster_path
 
 ot.ResourceMap.SetAsScalar("OptimizationAlgorithm-DefaultMaximumAbsoluteError", 1.0e-12)
 ot.ResourceMap.SetAsScalar("OptimizationAlgorithm-DefaultMaximumConstraintError", 1.0e-12)
@@ -29,140 +36,6 @@ ot.ResourceMap.SetAsScalar("Distribution-DiscreteDrawPDFScaling", 0.025)
 ot.ResourceMap.SetAsBool("Distribution-ShowSupportDiscretePDF", True)
 ot.ResourceMap.SetAsString("Distribution-SupportPointStyleDiscretePDF", "bullet")
 ot.ResourceMap.SetAsBool("Distribution-ScaleColorsDiscretePDF", True)
-
-def compute_moments(measure, polynoms, domain=None, Ngauss=100):
-    """Compute the moments int_Omega p_k(x) pdf(x) dx for each polynomial."""
-    pdf = measure.getPDF()
-    dimension = measure.getDimension()
-    moments = ot.Point(0)
-    if domain is None:
-        box = measure.getRange()
-        integration = ot.GaussLegendre([Ngauss] * dimension)
-        for p in polynoms:
-            moments.add(integration.integrate(pdf * p, box)[0])
-    else:
-        integration = ot.SimplicialCubature()
-        integration.setMaximumCallsNumber(Ngauss ** dimension)
-        for p in polynoms:
-            moments.add(integration.integrate(pdf * p, domain)[0])
-    return moments
-
-
-def generate_sample_points(measure, domain, S, dimension):
-    """Generate S sample points distributed uniformly over the domain."""
-    if domain is None:
-        D = measure.getRange()
-        a = D.getLowerBound()
-        b = D.getUpperBound()
-        sampling_dist = ot.JointDistribution(
-            [ot.Uniform(a[i], b[i]) for i in range(dimension)]
-        )
-        domain_out = D
-    else:
-        if isinstance(domain, ot.Mesh):
-            domain_out = ot.MeshDomain(domain)
-            sampling_dist = ot.UniformOverMesh(domain)
-            mesh = domain
-            a = mesh.getVertices().getMin()
-            b = mesh.getVertices().getMax()
-        else:
-            domain_out = domain
-            if isinstance(domain_out, ot.MeshDomain):
-                mesh = domain_out.getMesh()
-                a = mesh.getVertices().getMin()
-                b = mesh.getVertices().getMax()
-                sampling_dist = ot.UniformOverMesh(mesh)
-            else:
-                # fallback: uniform in bounding box
-                a = domain_out.getLowerBound()
-                b = domain_out.getUpperBound()
-                sampling_dist = ot.JointDistribution(
-                    [ot.Uniform(a[i], b[i]) for i in range(dimension)]
-                )
-    XS = sampling_dist.getSample(S)
-    return XS, a, b, domain_out
-
-
-def solve_lp(XS, polynoms, moments, sensitivity_values):
-    """Solve the discretized LP (eq. 3 in Ryu 2013).
-
-    Returns the vector of weights (alpha_i >= 0) for each sample point.
-    """
-    S = len(XS)
-    n = len(polynoms)
-    # Constraint matrix A (n x M): A[i,j] = p_i(s_j)
-    A = ot.DesignProxy(XS, polynoms).computeDesign(list(range(n))).transpose()
-    # Equality constraints: A * alpha == moments
-    constraint_bounds = ot.Interval(moments, moments)
-    # Variable bounds: 0 <= alpha_i <= 1
-    bounds = ot.Interval([0.0] * S, [1.0] * S)
-    # Cost: sensitivity function evaluated at each sample point
-    cost = list(sensitivity_values)
-    problem = otexp.LinearProblem(cost, bounds, A, constraint_bounds)
-    highs = otexp.HiGHS(problem)
-    highs.run()
-    result = highs.getResult()
-    alpha = result.getOptimalPoint()
-    return alpha
-
-
-def cluster_rule(XS, w, path, target_N):
-    """Apply a precomputed clustering path to obtain target_N clusters.
-
-    Each merge replaces two points by their weighted convex combination.
-    """
-    workingXS = ot.Sample(XS)
-    workingW = ot.Point(w)
-    for idx in range(len(path)):
-        if len(workingXS) <= target_N:
-            break
-        i1, i2 = path[idx]
-        X1 = workingXS[i1]
-        w1 = workingW[i1]
-        X2 = workingXS[i2]
-        w2 = workingW[i2]
-        new_w = w1 + w2
-        new_x = X1 * (w1 / new_w) + X2 * (w2 / new_w)
-        workingXS[i1] = new_x
-        workingW[i1] = new_w
-        workingXS[i2] = workingXS[-1]
-        workingW[i2] = workingW[-1]
-        workingXS = workingXS[:-1]
-        workingW = workingW[:-1]
-    return workingXS, workingW
-
-
-def build_cluster_path(XS, w):
-    """Build a greedy clustering path by repeatedly merging the smallest-weight
-    point with its nearest neighbor."""
-    workingXS = ot.Sample(XS)
-    workingW = ot.Point(w)
-    path = []
-    while len(workingXS) > 1:
-        i1 = int(np.argmin(workingW))
-        X1 = workingXS[i1]
-        w1 = workingW[i1]
-        d_min = ot.SpecFunc.MaxScalar
-        i2 = -1
-        for j in range(len(workingXS)):
-            if j == i1:
-                continue
-            d = (workingXS[j] - X1).normSquare()
-            if d < d_min:
-                d_min = d
-                i2 = j
-        X2 = workingXS[i2]
-        w2 = workingW[i2]
-        new_w = w1 + w2
-        new_x = X1 * (w1 / new_w) + X2 * (w2 / new_w)
-        path.append([i1, i2])
-        workingXS[i1] = new_x
-        workingW[i1] = new_w
-        workingXS[i2] = workingXS[-1]
-        workingW[i2] = workingW[-1]
-        workingXS = workingXS[:-1]
-        workingW = workingW[:-1]
-    return path
 
 
 def gauss_lp_quadrature(measure, polynoms, sensitivity=None, domain=None,
@@ -248,9 +121,7 @@ def gauss_lp_quadrature(measure, polynoms, sensitivity=None, domain=None,
     # ---- Step 4+5: cluster and refine ----
     path = build_cluster_path(XS_support, w)
 
-    # Try from N/(d+1) clusters up to n_support
-    # Try from 1 cluster up to n_support
-    n_min = 1#max(N // (dimension + 1), 1)
+    n_min = 1
     best_residual = ot.SpecFunc.MaxScalar
     best_nodes = None
     best_weights = None
@@ -268,13 +139,9 @@ def gauss_lp_quadrature(measure, polynoms, sensitivity=None, domain=None,
         size = len(XSi)
         flat_size = size * dimension
 
-        # Build objective: sum of squared moment residuals
-        # Variables: [w_0..w_{size-1}, x_0..x_{size*dimension-1}]
-        # For non-box domains, penalize points outside the domain
         need_domain_check = (domain is not None)
 
         if with_mean:
-            # Find which of the starting points is the closest to the mean
             iMean = 0
             dMean = (meanMeasure - XSi[0]).normSquare()
             for ic in range(1, len(XSi)):
@@ -300,14 +167,12 @@ def gauss_lp_quadrature(measure, polynoms, sensitivity=None, domain=None,
             residual = phi * w_part - moments
             value = residual.normSquare()
             if with_mean:
-                # Penalize the distance of the first node to the mean of the measure
                 value += (meanMeasure - XS_eval[iMean]).normSquare()
             return [value]
 
         objective = ot.PythonFunction(size + flat_size, 1, objective_py)
 
         problem = ot.OptimizationProblem(objective)
-        # Bounds: weights in [0, 1], nodes in domain box
         lb_weights = [0.0] * size
         ub_weights = [1.0] * size
         lb_nodes = list(a_lower) * size
@@ -316,7 +181,6 @@ def gauss_lp_quadrature(measure, polynoms, sensitivity=None, domain=None,
         problem.setBounds(bounds)
 
         algo = ot.TNC(problem)
-        # Cobyla needs enough evaluations: ~1000 per variable for convergence
         max_calls = max(10000, 1000 * (size + flat_size))
         algo.setMaximumCallsNumber(max_calls)
         algo.setMaximumIterationNumber(int(0.5 * max_calls))
@@ -382,84 +246,3 @@ def gauss_lp_quadrature(measure, polynoms, sensitivity=None, domain=None,
     return best_nodes, best_weights, moments
 
 
-if __name__ == "__main__":
-    # Test 1: Recover tensorized Gauss-Legendre quadrature
-    print("#" * 50)
-    print("Test 1: Recover tensorized Gauss-Legendre quadrature")
-    basis = ot.OrthogonalProductPolynomialFactory(
-        [ot.LegendreFactory()] * 2, ot.NormInfEnumerateFunction(2)
-    )
-    K = 3
-    polynoms = [basis.build(i) for i in range((2 * K) ** 2)]
-    N = len(polynoms)
-    print(f"N = {N}")
-    mu = basis.getMeasure()
-    xi, w, m = gauss_lp_quadrature(mu, polynoms, alphaS=100, Ngauss=100,
-                                   epsilon=1e-5, verbose=True, show_pdf=True)
-    print("Nodes:\n", xi)
-    print("Weights:", w)
-    print("Moments:", m)
-    ref = ot.GaussProductExperiment(mu, [K] * 2)
-    xi_ref, w_ref = ref.generateWithWeights()
-    print("Reference nodes:\n", xi_ref)
-    print("Reference weights:", w_ref)
-
-    # Test 2: Dirichlet distribution on a simplex
-    print("\n" + "#" * 50)
-    print("Test 2: Dirichlet distribution on a simplex")
-    basis = ot.OrthogonalProductPolynomialFactory(
-        [ot.LegendreFactory()] * 2, ot.NormInfEnumerateFunction(2)
-    )
-    mu = ot.Dirichlet([1, 1, 1])
-    support = ot.Mesh([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], [[0, 1, 2]])
-    K = 3
-    polynoms = [basis.build(i) for i in range((2 * K) ** 2)]
-    N = len(polynoms)
-    print(f"N = {N}")
-    xi, w, m = gauss_lp_quadrature(mu, polynoms, domain=support,
-                                   alphaS=200, Ngauss=100, epsilon=1e-5,
-                                   verbose=True, show_pdf=True)
-    print("Nodes:\n", xi)
-    print("Weights:", w)
-
-    # Test 3: Correlated Normal distribution
-    print("\n" + "#" * 50)
-    print("Test 3: Correlated Normal distribution")
-    basis = ot.OrthogonalProductPolynomialFactory(
-        [ot.HermiteFactory()] * 2, ot.NormInfEnumerateFunction(2)
-    )
-    rho = 0.5
-    R = ot.CorrelationMatrix(2, [1.0, rho, rho, 1.0])
-    mu = ot.Normal([0.0] * 2, [1.0] * 2, R)
-    K = 3
-    polynoms = [basis.build(i) for i in range((2 * K) ** 2)]
-    N = len(polynoms)
-    print(f"N = {N}")
-    xi, w, m = gauss_lp_quadrature(mu, polynoms, alphaS=100, Ngauss=100,
-                                   epsilon=1e-5, verbose=True, show_pdf=True)
-    print("Nodes:\n", xi)
-    print("Weights:", w)
-    for i, p in enumerate(polynoms):
-        val = sum(w[j] * p(xi[j])[0] for j in range(len(xi)))
-        print(f"  p_{i}: err={abs(val-m[i]):.2e}")
-
-    # Test 4: Correlated Normal distribution, application
-    print("\n" + "#" * 50)
-    print("Test 3: Correlated Normal distribution")
-    C = ot.CovarianceMatrix([[7.81e-4, 2.83e-3], [2.83e-3, 1.05e-2]])
-    mean = [0.986, 4.06]
-    mu = ot.Normal(mean, C)
-    print("R=", mu.getCorrelation())
-    basis = ot.OrthogonalProductPolynomialFactory([ot.StandardDistributionPolynomialFactory(ot.AdaptiveStieltjesAlgorithm(mu.getMarginal(i))) for i in range(2)], ot.NormInfEnumerateFunction(2))
-    K = 3
-    polynoms = [basis.build(i) for i in range((2 * K) ** 2)]
-    print([str(p) for p in polynoms])
-    N = len(polynoms)
-    print(f"N = {N}")
-    xi, w, m = gauss_lp_quadrature(mu, polynoms, alphaS=100, Ngauss=1000,
-                                   epsilon=1e-5, verbose=True, show_pdf=True)
-    print("Nodes:\n", xi)
-    print("Weights:", w)
-    for i, p in enumerate(polynoms):
-        val = sum(w[j] * p(xi[j])[0] for j in range(len(xi)))
-        print(f"  p_{i}: err={abs(val-m[i]):.5e}")
